@@ -84,10 +84,9 @@ class MsgNode:
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-
 async def create_reply_history(
         msg: discord.Message,
-        ):
+        ) -> tuple[list[dict[str, Literal['user','assistant']]],list[str]]:
     # Build message chain and set user warnings
     messages = []
     user_warnings = set()
@@ -168,8 +167,8 @@ async def create_reply_history(
 
 async def respond(
         msg: discord.Message,
-        messages,
-        user_warnings,
+        messages: list[dict[str, Literal['user','assistant']]], 
+        user_warnings: list[str],
         ):
     global msg_nodes, last_task_time
     # Generate and send response message(s) (can be multiple if response is long)
