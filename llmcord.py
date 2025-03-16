@@ -1,13 +1,13 @@
-import asyncio
 from base64 import b64encode
 from dataclasses import dataclass, field
 from datetime import datetime as dt
-import logging
 from typing import Literal, Optional
+import asyncio
+import logging
 
+from openai import AsyncOpenAI
 import discord
 import httpx
-from openai import AsyncOpenAI
 import yaml
 
 logging.basicConfig(
@@ -36,6 +36,25 @@ def get_config(filename="config.yaml"):
 
 cfg = get_config()
 
+allow_dms = cfg["allow_dms"]
+permissions = cfg["permissions"]
+
+provider, model = cfg["model"].split("/", 1)
+base_url = cfg["providers"][provider]["base_url"]
+api_key = cfg["providers"][provider].get("api_key", "sk-no-key-required")
+openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+
+accept_images = any(x in model.lower() for x in VISION_MODEL_TAGS)
+accept_usernames = any(x in provider.lower() for x in PROVIDERS_SUPPORTING_USERNAMES)
+
+max_text = cfg["max_text"]
+max_images = cfg["max_images"] if accept_images else 0
+max_messages = cfg["max_messages"]
+
+use_plain_responses = cfg["use_plain_responses"]
+max_message_length = 2000 if use_plain_responses else (4096 - len(STREAMING_INDICATOR))
+
+
 if client_id := cfg["client_id"]:
     logging.info(f"\n\nBOT INVITE URL:\nhttps://discord.com/api/oauth2/authorize?client_id={client_id}&permissions=412317273088&scope=bot\n")
 
@@ -46,8 +65,8 @@ discord_client = discord.Client(intents=intents, activity=activity)
 
 httpx_client = httpx.AsyncClient()
 
-msg_nodes = {}
 last_task_time = 0
+msg_nodes = {}
 
 
 @dataclass
@@ -66,57 +85,13 @@ class MsgNode:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
-@discord_client.event
-async def on_message(new_msg):
-    global msg_nodes, last_task_time
-
-    is_dm = new_msg.channel.type == discord.ChannelType.private
-
-    if (not is_dm and discord_client.user not in new_msg.mentions) or new_msg.author.bot:
-        return
-
-    role_ids = set(role.id for role in getattr(new_msg.author, "roles", ()))
-    channel_ids = set(id for id in (new_msg.channel.id, getattr(new_msg.channel, "parent_id", None), getattr(new_msg.channel, "category_id", None)) if id)
-
-    cfg = get_config()
-
-    allow_dms = cfg["allow_dms"]
-    permissions = cfg["permissions"]
-
-    (allowed_user_ids, blocked_user_ids), (allowed_role_ids, blocked_role_ids), (allowed_channel_ids, blocked_channel_ids) = (
-        (perm["allowed_ids"], perm["blocked_ids"]) for perm in (permissions["users"], permissions["roles"], permissions["channels"])
-    )
-
-    allow_all_users = not allowed_user_ids if is_dm else not allowed_user_ids and not allowed_role_ids
-    is_good_user = allow_all_users or new_msg.author.id in allowed_user_ids or any(id in allowed_role_ids for id in role_ids)
-    is_bad_user = not is_good_user or new_msg.author.id in blocked_user_ids or any(id in blocked_role_ids for id in role_ids)
-
-    allow_all_channels = not allowed_channel_ids
-    is_good_channel = allow_dms if is_dm else allow_all_channels or any(id in allowed_channel_ids for id in channel_ids)
-    is_bad_channel = not is_good_channel or any(id in blocked_channel_ids for id in channel_ids)
-
-    if is_bad_user or is_bad_channel:
-        return
-
-    provider, model = cfg["model"].split("/", 1)
-    base_url = cfg["providers"][provider]["base_url"]
-    api_key = cfg["providers"][provider].get("api_key", "sk-no-key-required")
-    openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
-
-    accept_images = any(x in model.lower() for x in VISION_MODEL_TAGS)
-    accept_usernames = any(x in provider.lower() for x in PROVIDERS_SUPPORTING_USERNAMES)
-
-    max_text = cfg["max_text"]
-    max_images = cfg["max_images"] if accept_images else 0
-    max_messages = cfg["max_messages"]
-
-    use_plain_responses = cfg["use_plain_responses"]
-    max_message_length = 2000 if use_plain_responses else (4096 - len(STREAMING_INDICATOR))
-
+async def create_reply_history(
+        msg: discord.Message,
+        ):
     # Build message chain and set user warnings
     messages = []
     user_warnings = set()
-    curr_msg = new_msg
+    curr_msg = msg
 
     while curr_msg != None and len(messages) < max_messages:
         curr_node = msg_nodes.setdefault(curr_msg.id, MsgNode())
@@ -189,17 +164,14 @@ async def on_message(new_msg):
                 user_warnings.add(f"⚠️ Only using last {len(messages)} message{'' if len(messages) == 1 else 's'}")
 
             curr_msg = curr_node.parent_msg
+    return messages, user_warnings
 
-    logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
-
-    if system_prompt := cfg["system_prompt"]:
-        system_prompt_extras = [f"Today's date: {dt.now().strftime('%B %d %Y')}."]
-        if accept_usernames:
-            system_prompt_extras.append("User's names are their Discord IDs and should be typed as '<@ID>'.")
-
-        full_system_prompt = "\n".join([system_prompt] + system_prompt_extras)
-        messages.append(dict(role="system", content=full_system_prompt))
-
+async def respond(
+        msg: discord.Message,
+        messages,
+        user_warnings,
+        ):
+    global msg_nodes, last_task_time
     # Generate and send response message(s) (can be multiple if response is long)
     curr_content = finish_reason = edit_task = None
     response_msgs = []
@@ -211,7 +183,7 @@ async def on_message(new_msg):
 
     kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_body=cfg["extra_api_parameters"])
     try:
-        async with new_msg.channel.typing():
+        async with msg.channel.typing():
             async for curr_chunk in await openai_client.chat.completions.create(**kwargs):
                 if finish_reason != None:
                     break
@@ -245,11 +217,11 @@ async def on_message(new_msg):
                         embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
 
                         if start_next_msg:
-                            reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
+                            reply_to_msg = msg if response_msgs == [] else response_msgs[-1]
                             response_msg = await reply_to_msg.reply(embed=embed, silent=True)
                             response_msgs.append(response_msg)
 
-                            msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
+                            msg_nodes[response_msg.id] = MsgNode(parent_msg=msg)
                             await msg_nodes[response_msg.id].lock.acquire()
                         else:
                             edit_task = asyncio.create_task(response_msgs[-1].edit(embed=embed))
@@ -258,15 +230,58 @@ async def on_message(new_msg):
 
             if use_plain_responses:
                 for content in response_contents:
-                    reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
+                    reply_to_msg = msg if response_msgs == [] else response_msgs[-1]
                     response_msg = await reply_to_msg.reply(content=content, suppress_embeds=True)
                     response_msgs.append(response_msg)
 
-                    msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
+                    msg_nodes[response_msg.id] = MsgNode(parent_msg=msg)
                     await msg_nodes[response_msg.id].lock.acquire()
 
     except Exception:
         logging.exception("Error while generating response")
+    return response_msgs, response_contents
+
+
+@discord_client.event
+async def on_message(new_msg):
+    global msg_nodes, last_task_time
+
+    is_dm = new_msg.channel.type == discord.ChannelType.private
+
+    if (not is_dm and discord_client.user not in new_msg.mentions) or new_msg.author.bot:
+        return
+
+    role_ids = set(role.id for role in getattr(new_msg.author, "roles", ()))
+    channel_ids = set(id for id in (new_msg.channel.id, getattr(new_msg.channel, "parent_id", None), getattr(new_msg.channel, "category_id", None)) if id)
+
+    (allowed_user_ids, blocked_user_ids), (allowed_role_ids, blocked_role_ids), (allowed_channel_ids, blocked_channel_ids) = (
+        (perm["allowed_ids"], perm["blocked_ids"]) for perm in (permissions["users"], permissions["roles"], permissions["channels"])
+    )
+
+    allow_all_users = not allowed_user_ids if is_dm else not allowed_user_ids and not allowed_role_ids
+    is_good_user = allow_all_users or new_msg.author.id in allowed_user_ids or any(id in allowed_role_ids for id in role_ids)
+    is_bad_user = not is_good_user or new_msg.author.id in blocked_user_ids or any(id in blocked_role_ids for id in role_ids)
+
+    allow_all_channels = not allowed_channel_ids
+    is_good_channel = allow_dms if is_dm else allow_all_channels or any(id in allowed_channel_ids for id in channel_ids)
+    is_bad_channel = not is_good_channel or any(id in blocked_channel_ids for id in channel_ids)
+
+    if is_bad_user or is_bad_channel:
+        return
+
+    messages, user_warnings = await create_reply_history(new_msg)
+    response_msgs, response_contents = await respond(new_msg, messages, user_warnings)
+
+    logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
+
+    if system_prompt := cfg["system_prompt"]:
+        system_prompt_extras = [f"Today's date: {dt.now().strftime('%B %d %Y')}."]
+        if accept_usernames:
+            system_prompt_extras.append("User's names are their Discord IDs and should be typed as '<@ID>'.")
+
+        full_system_prompt = "\n".join([system_prompt] + system_prompt_extras)
+        messages.append(dict(role="system", content=full_system_prompt))
+
 
     for response_msg in response_msgs:
         msg_nodes[response_msg.id].text = "".join(response_contents)
